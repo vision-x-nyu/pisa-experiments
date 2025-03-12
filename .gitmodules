@@ -1,0 +1,9 @@
+[submodule "RAFT"]
+	path = RAFT
+	url = https://github.com/princeton-vl/RAFT.git
+[submodule "Depth"]
+	path = Depth
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+[submodule "kubric"]
+	path = kubric
+	url = https://github.com/google-research/kubric.git

@@ -1,0 +1,11 @@
+path,text,num_frames,height,width,aspect_ratio,resolution,sample,split,mask_strategy
+/data/pisa/training_data/psft/00000/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00000,train,0
+/data/pisa/training_data/psft/00001/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00001,train,0
+/data/pisa/training_data/psft/00002/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00002,train,0
+/data/pisa/training_data/psft/00003/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00003,train,0
+/data/pisa/training_data/psft/00004/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00004,train,0
+/data/pisa/training_data/psft/00005/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00005,train,0
+/data/pisa/training_data/psft/00006/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00006,train,0
+/data/pisa/training_data/psft/00007/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00007,train,0
+/data/pisa/training_data/psft/00008/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00008,train,0
+/data/pisa/training_data/psft/00009/rgba_00000.jpg,a video of an object dropping,32,256,256,1.0,65536,00009,train,0

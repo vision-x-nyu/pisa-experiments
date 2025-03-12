@@ -1,0 +1,564 @@
+import os
+from contextlib import nullcontext
+from copy import deepcopy
+from datetime import timedelta
+from pprint import pformat
+
+import torch
+import torch.distributed as dist
+import wandb
+from colossalai.booster import Booster
+from colossalai.cluster import DistCoordinator
+from colossalai.nn.optimizer import HybridAdam
+from colossalai.utils import get_current_device, set_seed
+from tqdm import tqdm
+import torch.nn.functional as F
+
+from opensora.acceleration.checkpoint import set_grad_checkpoint
+from opensora.acceleration.parallel_states import get_data_parallel_group
+from opensora.datasets.dataloader import prepare_dataloader
+from opensora.datasets.aspect import get_num_frames, get_image_size
+from opensora.datasets.utils import save_sample
+from opensora.registry import DATASETS, MODELS, SCHEDULERS, build_module
+from opensora.utils.ckpt_utils import load, model_gathering, model_sharding, record_model_param_shape, save
+from opensora.utils.config_utils import define_experiment_workspace, parse_configs, save_training_config
+from opensora.utils.lr_scheduler import LinearWarmupLR
+from opensora.utils.misc import (
+    Timer,
+    all_reduce_mean,
+    create_logger,
+    create_tensorboard_writer,
+    format_numel_str,
+    get_model_numel,
+    requires_grad,
+    to_torch_dtype,
+)
+from PIL import Image
+from opensora.utils.train_utils import MaskGenerator, create_colossalai_plugin, update_ema
+from opensora.utils.inference_utils import prepare_multi_resolution_info, collect_references_batch, apply_mask_strategy
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, ToPILImage
+from torchvision import transforms
+
+try:
+    from torchvision.transforms import InterpolationMode
+
+    BICUBIC = InterpolationMode.BICUBIC
+    BILINEAR = InterpolationMode.BILINEAR
+except ImportError:
+    BICUBIC = Image.BICUBIC
+    BILINEAR = Image.BILINEAR
+import sys
+import argparse
+
+sys.path = ["Depth"] + sys.path
+from depth_anything_v2.dpt import DepthAnythingV2
+
+
+def build_depth_estimator(device, model_path):
+    model_configs = {
+        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        "vitg": {"encoder": "vitg", "features": 384, "out_channels": [1536, 1536, 1536, 1536]},
+    }
+    depth_anything = DepthAnythingV2(**model_configs["vits"])
+    depth_anything.load_state_dict(torch.load(model_path, map_location="cpu"))
+    depth_anything = depth_anything.to(device).eval()
+    return depth_anything
+
+
+def compute_depth(model, video):
+    # video: [b, f, c, h, w] range: [0, 255]
+    batch_size, num_frame, _, frame_height, frame_width = (
+        video.shape[0],
+        video.shape[1],
+        video.shape[2],
+        video.shape[3],
+        video.shape[4],
+    )
+    transform = Compose(
+        [
+            transforms.Resize((518, 518), interpolation=Image.BICUBIC),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    # [b, f, c, h, w] -> [b*f, c, h, w]
+    video = video.flatten(0, 1).to(dtype=torch.float32)
+    video /= 255
+
+    video = transform(video)
+    depth = model(video)
+    # [b*f, h, w]
+    depth = F.interpolate(depth[:, None], (frame_height, frame_width), mode="bilinear", align_corners=False)
+    depth = depth.squeeze(1)
+    # scale to [0, 255] frame wise
+    frame_max = depth.amax(dim=(1, 2), keepdim=True)
+    frame_min = depth.amin(dim=(1, 2), keepdim=True)
+    depth = (depth - frame_min) / (frame_max - frame_min) * 255.0
+    # [b, f, h, w]
+    depth = depth.reshape(batch_size, num_frame, frame_height, frame_width)
+    depth = depth.to(dtype=torch.float32)
+    return depth
+
+
+def compute_depth_loss(model, samples, videos):
+    # samples & videos: [B*T, C, H, W], scale: [0, 255]
+    samples_depth = compute_depth(model, samples)
+    videos_depth = compute_depth(model, videos).detach()
+    loss = F.mse_loss(samples_depth, videos_depth)
+    return loss.mean()
+
+
+def main():
+    # ======================================================
+    # 1. configs & runtime variables
+    # ======================================================
+    # == parse configs ==
+    cfg = parse_configs(training=True)
+    record_time = cfg.get("record_time", False)
+
+    # == device and dtype ==
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    cfg_dtype = cfg.get("dtype", "bf16")
+    assert cfg_dtype in ["fp16", "bf16"], f"Unknown mixed precision {cfg_dtype}"
+    dtype = to_torch_dtype(cfg.get("dtype", "bf16"))
+
+    # == colossalai init distributed training ==
+    # NOTE: A very large timeout is set to avoid some processes exit early
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
+    torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+    set_seed(cfg.get("seed", 1024))
+    coordinator = DistCoordinator()
+    device = get_current_device()
+
+    # == init exp_dir ==
+    exp_name, exp_dir = define_experiment_workspace(cfg)
+    coordinator.block_all()
+    if coordinator.is_master():
+        os.makedirs(exp_dir, exist_ok=True)
+        save_training_config(cfg.to_dict(), exp_dir)
+    coordinator.block_all()
+
+    # == init logger, tensorboard & git  ==
+    logger = create_logger(exp_dir)
+    logger.info("Experiment directory created at %s", exp_dir)
+    logger.info("Training configuration:\n %s", pformat(cfg.to_dict()))
+    if coordinator.is_master():
+        tb_writer = create_tensorboard_writer(exp_dir)
+        if cfg.get("wandb", False):
+            wandb.init(project="oro_exps", entity="nyu-visionx", name=exp_name, config=cfg.to_dict())
+    dist.barrier()
+
+    # == init ColossalAI booster ==
+    plugin = create_colossalai_plugin(
+        plugin=cfg.get("plugin", "zero2"),
+        dtype=cfg_dtype,
+        grad_clip=cfg.get("grad_clip", 0),
+        sp_size=cfg.get("sp_size", 1),
+        reduce_bucket_size_in_m=cfg.get("reduce_bucket_size_in_m", 20),
+    )
+    booster = Booster(plugin=plugin)
+    torch.set_num_threads(1)
+
+    # ======================================================
+    # 2. build dataset and dataloader
+    # ======================================================
+    logger.info("Building dataset...")
+    # == build dataset ==
+    dataset = build_module(cfg.dataset, DATASETS)
+    logger.info("Dataset contains %s samples.", len(dataset))
+
+    # == build dataloader ==
+    dataloader_args = dict(
+        dataset=dataset,
+        batch_size=cfg.get("batch_size", None),
+        num_workers=cfg.get("num_workers", 4),
+        seed=cfg.get("seed", 1024),
+        shuffle=True,
+        drop_last=True,
+        pin_memory=True,
+        process_group=get_data_parallel_group(),
+        prefetch_factor=cfg.get("prefetch_factor", None),
+    )
+    dataloader, sampler = prepare_dataloader(
+        bucket_config=cfg.get("bucket_config", None),
+        num_bucket_build_workers=cfg.get("num_bucket_build_workers", 1),
+        **dataloader_args,
+    )
+    num_steps_per_epoch = len(dataloader)
+
+    if cfg.get("val_dataset", False):
+        val_dataset = build_module(cfg.val_dataset, DATASETS)
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=cfg.get("batch_size", None),
+            num_workers=cfg.get("num_workers", 4),
+            shuffle=False,
+            drop_last=False,
+            pin_memory=True,
+        )
+
+    # ======================================================
+    # 3. build model
+    # ======================================================
+    logger.info("Building models...")
+    # == build text-encoder and vae ==
+    text_encoder = build_module(cfg.get("text_encoder", None), MODELS, device=device, dtype=dtype)
+    if text_encoder is not None:
+        text_encoder_output_dim = text_encoder.output_dim
+        text_encoder_model_max_length = text_encoder.model_max_length
+    else:
+        text_encoder_output_dim = cfg.get("text_encoder_output_dim", 4096)
+        text_encoder_model_max_length = cfg.get("text_encoder_model_max_length", 300)
+
+    # == build vae ==
+    vae = build_module(cfg.get("vae", None), MODELS)
+    if vae is not None:
+        vae = vae.to(device, dtype).eval()
+    if vae is not None:
+        input_size = (dataset.num_frames, *dataset.image_size)
+        latent_size = vae.get_latent_size(input_size)
+        vae_out_channels = vae.out_channels
+    else:
+        latent_size = (None, None, None)
+        vae_out_channels = cfg.get("vae_out_channels", 4)
+
+    # == build diffusion model ==
+    model = (
+        build_module(
+            cfg.model,
+            MODELS,
+            input_size=latent_size,
+            in_channels=vae_out_channels,
+            caption_channels=text_encoder_output_dim,
+            model_max_length=text_encoder_model_max_length,
+            enable_sequence_parallelism=cfg.get("sp_size", 1) > 1,
+        )
+        .to(device, dtype)
+        .train()
+    )
+    model_numel, model_numel_trainable = get_model_numel(model)
+    logger.info(
+        "[Diffusion] Trainable model params: %s, Total model params: %s",
+        format_numel_str(model_numel_trainable),
+        format_numel_str(model_numel),
+    )
+
+    # == build ema for diffusion model ==
+    ema = deepcopy(model).to(torch.float32).to(device)
+    requires_grad(ema, False)
+    ema_shape_dict = record_model_param_shape(ema)
+    ema.eval()
+    update_ema(ema, model, decay=0, sharded=False)
+    # == build DepthAnything-V2 model ==
+    # TODO: Modify the path
+    depth_estimator_path = "models/depth_anything_v2_vits.pth"
+    depth_estimator = build_depth_estimator(device, depth_estimator_path)
+    for param in depth_estimator.parameters():
+        param.requires_grad = False
+    # == setup loss function, build scheduler ==
+    scheduler = build_module(cfg.scheduler, SCHEDULERS)
+
+    # == setup optimizer ==
+    optimizer = HybridAdam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        adamw_mode=True,
+        lr=cfg.get("lr", 1e-4),
+        weight_decay=cfg.get("weight_decay", 0),
+        eps=cfg.get("adam_eps", 1e-8),
+    )
+
+    warmup_steps = cfg.get("warmup_steps", None)
+
+    if warmup_steps is None:
+        lr_scheduler = None
+    else:
+        lr_scheduler = LinearWarmupLR(optimizer, warmup_steps=cfg.get("warmup_steps"))
+
+    # == additional preparation ==
+    if cfg.get("grad_checkpoint", False):
+        set_grad_checkpoint(model)
+    if cfg.get("mask_ratios", None) is not None:
+        mask_generator = MaskGenerator(cfg.mask_ratios)
+
+    # =======================================================
+    # 4. distributed training preparation with colossalai
+    # =======================================================
+    logger.info("Preparing for distributed training...")
+    # == boosting ==
+    # NOTE: we set dtype first to make initialization of model consistent with the dtype; then reset it to the fp32 as we make diffusion scheduler in fp32
+    torch.set_default_dtype(dtype)
+    model, optimizer, _, dataloader, lr_scheduler = booster.boost(
+        model=model,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        dataloader=dataloader,
+    )
+    torch.set_default_dtype(torch.float)
+    logger.info("Boosting model for distributed training")
+
+    # == global variables ==
+    cfg_epochs = cfg.get("epochs", 1000)
+    start_epoch = start_step = log_step = acc_step = 0
+    running_loss = 0.0
+    logger.info("Training for %s epochs with %s steps per epoch", cfg_epochs, num_steps_per_epoch)
+
+    # == resume ==
+    if cfg.get("load", None) is not None:
+        logger.info("Loading checkpoint")
+        ret = load(
+            booster,
+            cfg.load,
+            model=model,
+            ema=ema,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            sampler=None if cfg.get("start_from_scratch", False) else sampler,
+        )
+        if not cfg.get("start_from_scratch", False):
+            start_epoch, start_step = ret
+        logger.info("Loaded checkpoint %s at epoch %s step %s", cfg.load, start_epoch, start_step)
+
+    model_sharding(ema)
+
+    # =======================================================
+    # 5. training loop
+    # =======================================================
+    dist.barrier()
+    timers = {}
+    timer_keys = [
+        "move_data",
+        "encode",
+        "mask",
+        "diffusion",
+        "backward",
+        "update_ema",
+        "reduce_loss",
+    ]
+    for key in timer_keys:
+        if record_time:
+            timers[key] = Timer(key, coordinator=coordinator)
+        else:
+            timers[key] = nullcontext()
+    # !!!
+    text_encoder.y_embedder = model.module.y_embedder  # copied from inference.py to avoid error
+    image_size = cfg.get("image_size", None)
+    num_frames = get_num_frames(cfg.num_frames)
+    input_size = (num_frames, *image_size)
+    latent_size = vae.get_latent_size(input_size)
+    dtype = to_torch_dtype(cfg.get("dtype", "bf16"))
+    align = cfg.get("align", None)
+
+    for epoch in range(start_epoch, cfg_epochs):
+        # == set dataloader to new epoch ==
+        sampler.set_epoch(epoch)
+        dataloader_iter = iter(dataloader)
+        logger.info("Beginning epoch %s...", epoch)
+
+        if cfg.get("val_dataset", False) and epoch % cfg.get("eval_every", 1) == 0:
+            logger.info(f"Running inference evaluation at epoch {epoch}!")
+            run_eval(model, vae, scheduler, text_encoder, val_dataloader, cfg, epoch, exp_dir)
+            dist.barrier()
+
+        # == training loop in an epoch ==
+        with tqdm(
+            enumerate(dataloader_iter, start=start_step),
+            desc=f"Epoch {epoch}",
+            disable=not coordinator.is_master(),
+            initial=start_step,
+            total=num_steps_per_epoch,
+        ) as pbar:
+            for step, batch in pbar:
+                timer_list = []
+                batch_size = len(batch["video"])
+                model_args = prepare_multi_resolution_info(
+                    cfg.get("multi_resolution", None), batch_size, image_size, num_frames, dataset.fps, device, dtype
+                )
+                for i in range(len(batch["path"])):
+                    batch["path"][i] = os.path.join(batch["path"][i], "rgba_00000.jpg")
+                refs = collect_references_batch(batch["path"], vae, image_size)
+                z = torch.randn(batch_size, vae.out_channels, *latent_size, device=device, dtype=dtype)
+                masks = apply_mask_strategy(z, refs, ["0"] * batch_size, 0, align=align)
+                samples = scheduler.sample(
+                    model,
+                    text_encoder,
+                    z=z,
+                    prompts=batch["text"],
+                    device=device,
+                    additional_args=model_args,
+                    progress=True,
+                    mask=masks,
+                )
+                samples = vae.decode(samples.to(dtype), num_frames=num_frames)  # [B, C, T, H, W]
+                samples = (
+                    samples.mul(255).add_(0.5).clamp_(0, 255).permute(0, 2, 1, 3, 4)
+                )  # [B, C, T, H, W] -> [B, T, C, H, W]
+                # Depth LOSS
+                videos = batch["video"].to(device, dtype)  # [B, C, T, H, W]
+                videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W] -> [B, T, C, H, W]
+                # [-1, 1] -> [0, 255]
+                videos = (videos + 1) * 127.5
+                loss = compute_depth_loss(depth_estimator, samples, videos)
+                # == backward & update ==
+                with timers["backward"] as backward_t:
+                    booster.backward(loss=loss, optimizer=optimizer)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # update learning rate
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                if record_time:
+                    timer_list.append(backward_t)
+
+                # == update EMA ==
+                with timers["update_ema"] as ema_t:
+                    update_ema(ema, model.module, optimizer=optimizer, decay=cfg.get("ema_decay", 0.9999))
+                if record_time:
+                    timer_list.append(ema_t)
+
+                # == update log info ==
+                with timers["reduce_loss"] as reduce_loss_t:
+                    all_reduce_mean(loss)
+                    running_loss += loss.item()
+                    global_step = epoch * num_steps_per_epoch + step
+                    log_step += 1
+                    acc_step += 1
+                if record_time:
+                    timer_list.append(reduce_loss_t)
+
+                # == logging ==
+                if coordinator.is_master() and (global_step + 1) % cfg.get("log_every", 1) == 0:
+                    avg_loss = running_loss / log_step
+                    # progress bar
+                    pbar.set_postfix({"loss": avg_loss, "step": step, "global_step": global_step})
+                    # tensorboard
+                    tb_writer.add_scalar("loss", loss.item(), global_step)
+                    # wandb
+                    if cfg.get("wandb", False):
+                        wandb_dict = {
+                            "iter": global_step,
+                            "acc_step": acc_step,
+                            "epoch": epoch,
+                            "loss": loss.item(),
+                            "avg_loss": avg_loss,
+                            "lr": optimizer.param_groups[0]["lr"],
+                        }
+                        if record_time:
+                            wandb_dict.update(
+                                {
+                                    "debug/backward_time": backward_t.elapsed_time,
+                                    "debug/update_ema_time": ema_t.elapsed_time,
+                                    "debug/reduce_loss_time": reduce_loss_t.elapsed_time,
+                                }
+                            )
+                        wandb.log(wandb_dict, step=global_step)
+
+                    running_loss = 0.0
+                    log_step = 0
+
+                dist.barrier()
+
+                # == checkpoint saving ==
+                ckpt_every = cfg.get("ckpt_every", 0)
+                if ckpt_every > 0 and (global_step + 1) % ckpt_every == 0:
+                    model_gathering(ema, ema_shape_dict)
+                    save_dir = save(
+                        booster,
+                        exp_dir,
+                        model=model,
+                        ema=ema,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        sampler=sampler,
+                        epoch=epoch,
+                        step=step + 1,
+                        global_step=global_step + 1,
+                        batch_size=cfg.get("batch_size", None),
+                    )
+                    if dist.get_rank() == 0:
+                        model_sharding(ema)
+                    logger.info(
+                        "Saved checkpoint at epoch %s, step %s, global_step %s to %s",
+                        epoch,
+                        step + 1,
+                        global_step + 1,
+                        save_dir,
+                    )
+                if record_time:
+                    log_str = f"Rank {dist.get_rank()} | Epoch {epoch} | Step {step} | "
+                    for timer in timer_list:
+                        log_str += f"{timer.name}: {timer.elapsed_time:.3f}s | "
+                    print(log_str)
+
+        sampler.reset()
+        start_step = 0
+
+
+@torch.no_grad()
+def run_eval(
+    model,
+    vae,
+    scheduler,
+    text_encoder,
+    val_dataloader,
+    cfg,
+    epoch,
+    exp_dir,
+):
+    if dist.get_rank() != 0:
+        return
+    save_dir = os.path.join(exp_dir, "samples", f"epoch_{epoch:03d}")
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    vae.eval()
+    text_encoder.y_embedder = model.module.y_embedder  # copied from inference.py to avoid error
+    image_size = cfg.get("image_size", None)
+    num_frames = get_num_frames(cfg.num_frames)
+    input_size = (num_frames, *image_size)
+    latent_size = vae.get_latent_size(input_size)
+    device = "cuda"
+    dtype = to_torch_dtype(cfg.get("dtype", "bf16"))
+    align = cfg.get("align", None)
+    for _, batch in enumerate(iter(val_dataloader)):
+        batch_size = len(batch["video"])
+        model_args = prepare_multi_resolution_info(
+            cfg.get("multi_resolution", None),
+            batch_size,
+            image_size,
+            num_frames,
+            val_dataloader.dataset.fps,
+            device,
+            dtype,
+        )
+        refs = collect_references_batch(batch["path"], vae, image_size)
+        z = torch.randn(batch_size, vae.out_channels, *latent_size, device=device, dtype=dtype)
+        masks = apply_mask_strategy(z, refs, ["0"] * batch_size, 0, align=align)
+        samples = scheduler.sample(
+            model,
+            text_encoder,
+            z=z,
+            prompts=batch["text"],
+            device=device,
+            additional_args=model_args,
+            progress=True,
+            mask=masks,
+        )
+        samples = vae.decode(samples.to(dtype), num_frames=num_frames)
+        for i, s in enumerate(samples):
+            sample_dir = os.path.join(save_dir, batch["split"][i])
+            os.makedirs(sample_dir, exist_ok=True)
+            sample_num = batch["sample"][i]
+
+            sample_save_path = os.path.join(sample_dir, f"{sample_num:03d}")
+            save_sample(s, save_path=sample_save_path, fps=cfg.save_fps)
+
+            gt_save_path = os.path.join(sample_dir, f"{sample_num:03d}_gt")
+            save_sample(batch["video"][i], save_path=gt_save_path, fps=cfg.save_fps)
+
+    model.train()
+    vae.train()
+
+
+if __name__ == "__main__":
+    main()
