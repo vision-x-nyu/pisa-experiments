@@ -4,7 +4,7 @@
 <!-- <img src="docs/resources/preview.png" width="50%"/>
 <br /> -->
 
-<a href="https://arxiv.org/abs/1" target="_blank">
+<a href="https://arxiv.org/pdf/2503.09595" target="_blank">
     <img alt="arXiv" src="https://img.shields.io/badge/arXiv-pisa--experiments-red?logo=arxiv" height="20" /></a>
 <a href="https://vision-x-nyu.github.io/pisa-experiments.github.io" target="_blank">
     <img alt="Website" src="https://img.shields.io/badge/🌎_Website-pisa--experiments-blue.svg" height="20" /></a>
