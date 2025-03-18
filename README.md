@@ -235,10 +235,10 @@ We appreciate the following GitHub repos a lot for their valuable code and effor
 If you find our paper and code useful in your research, please consider giving us a star ⭐ and citing our work 📝.
 ```
 @article{li2025pisa,
-    title={Pisa Experiments: Exploring Physics Post-Training for Video Diffusion Models by Watching Stuff Drop},
-    author={Li, Chenyu and Michel, Oscar and Pan, Xichen and Liu, Sainan and Roberts, Mike and Xie, Saining},
-    journal={arXiv preprint arXiv:2503.09595},
-    year={2025},
+  title={PISA Experiments: Exploring Physics Post-Training for Video Diffusion Models by Watching Stuff Drop},
+  author={Li, Chenyu and Michel, Oscar and Pan, Xichen and Liu, Sainan and Roberts, Mike and Xie, Saining},
+  journal={arXiv preprint arXiv:2503.09595},
+  year={2025}
 }
 ```
 ## Contact
