@@ -178,13 +178,13 @@ We use the [Google Scanned Objects](https://research.google/blog/scanned-objects
 For generating a single video, please run:
 
 ```bash
-bash sim_data/generate_single_sample.sh
+bash scripts/sim_data/generate_single_sample.sh
 ```
 
 If you would like to generate many examples in parallel, you can run:
 
 ```bash
-bash sim_data/generate_parallel.sh
+bash scripts/sim_data/generate_parallel.sh
 ```
 
 ## Post-Training

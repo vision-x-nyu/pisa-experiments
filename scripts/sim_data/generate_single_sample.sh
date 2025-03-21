@@ -1,0 +1,11 @@
+python sim_data/run.py \
+    --video_id=00000 \
+    --output_dir=sim_output \
+    --scenario="fall" \
+    --resolution=512x512 \
+    --num_threads=8 \
+    --save_mp4 \
+    --save_gif \
+    --objects_split train \
+    --backgrounds_split train \
+    --seed 0
