@@ -32,6 +32,7 @@
 </div>      
 
 ## Release
+- `2025-5-1` : ♥️ Our paper `。PISA Experiments` is accepted by ICML 2025! See u in Vancouver!
 - `2025-3-12` :rocket: We released our [PisaBench](https://huggingface.co/datasets/nyu-visionx/pisa-experiments/tree/main/pisabench), [training data](https://huggingface.co/datasets/nyu-visionx/pisa-experiments/tree/main/training_data), [model checkpoints](https://huggingface.co/datasets/nyu-visionx/pisa-experiments/tree/main/checkpoints), and code.
 
 ## Contents
